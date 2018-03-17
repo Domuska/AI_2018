@@ -73,23 +73,57 @@ def tinyMazeSearch(problem):
     return  [s, s, w, s, w, w, s, w]
 
 class Search:
-    def __init__(self, problem):
+    def __init__(self, problem, searchType, heuristic=None, options={}):
         from util import Stack
-        self.parents = {}
-        self.finalCoordinates = None
-        self.expandedCoordinates = {}
-        self.unvisitedCoordinates = Stack()
-        self.problem = problem
+        from util import Queue
+        from util import PriorityQueue
+        from util import InformativePriorityQueue
+
+        from game import Directions
+
+        global OPT_KEY_MULTIPLE_GOALS
+        global OPT_KEY_STR_GOAL
 
         self.DEBUG_STEP = False
         self.DEBUG_PRINTS = False
+        self.DEBUG_ROUTE_PRINTS = False
         self.SUPPRESS_ERRORS = False
 
         self.COORDINATES_POSITION = 0
         self.DIRECTION_POSITION = 1
+        self.COST_POSITION = 2
+        self.DFS_TYPE = "dfs"
+        self.BFS_TYPE = "bfs"
+        self.UCS_TYPE = "ucs"
+        self.ASTAR_TYPE = "astar"
+        self.EMPTY_NODE = (None, None, None)
+
+        self.problem = problem
+        self.searchType = searchType
+        self.heuristic = heuristic
+        self.options = options
+
+        self.parents = {}
+        self.finalCoordinates = None
+        self.expandedCoordinates = {}
+        self.rawNodes = {}
+
+        if self.isAstarSearch():
+            if None == self.heuristic:
+                raise Exception("No heuristic provided for A* search")
+
+        if self.isDepthFirstSearch():
+            self.unvisitedCoordinates = Stack()
+        elif self.isBreadthFirstSearch():
+            self.unvisitedCoordinates = Queue()
+        elif self.isUniformCostSearch() or self.isAstarSearch():
+            self.unvisitedCoordinates = InformativePriorityQueue()
+        else:
+            raise Exception("Unknown search type: " + searchType)
 
     def run(self):
         node = None
+        latestCoordinates = None
 
         while True:
             if self.DEBUG_STEP:
@@ -97,24 +131,25 @@ class Search:
 
             node = self.visitNext(node)
 
-            if None == node:
+            # All nodes processed
+            if self.EMPTY_NODE == node:
                 break
 
             latestCoordinates = self.extractCoordinates(node)
-            if self.problem.isGoalState(latestCoordinates):
-                if self.DEBUG_PRINTS:
-                    print "Next node to visit is goal state. Node is: " + str(node)
+            isGoalState = self.isNodeGoalState(node)
+
+            if isGoalState:
                 break
 
         self.finalCoordinates = latestCoordinates
-        return self.constructRoute()
+        return self.constructFinalRoute()
 
     # Update nodes which can be visited and give next node to visit
     def visitNext(self, node):
         if None == node:
             startState = self.problem.getStartState()
-            self.addUnvisitedNode(startState)
             self.addNodeParent(startState, None) # Starting node has no parent
+            self.addUnvisitedNode(startState)
         else:
             # DFS will always want to try and expand current node
             self.expand(node)
@@ -141,21 +176,55 @@ class Search:
         # causes problems.
         self.markExpanded(node)
 
-        coordinates = self.extractCoordinates(node)
-        successors = self.problem.getSuccessors(coordinates)
-        for s in successors:
-            if self.isAlreadyExpanded(s):
-                continue
-            self.addUnvisitedNode(s)
-            self.addNodeParent(s, coordinates)
+        self.handleFringe(node)
 
         if self.DEBUG_PRINTS:
             print "Done expanding node: " + str(node)
 
-    # Generate list of directions from starting position to finish.
-    def constructRoute(self):
+    def handleFringe(self, node):
+        coordinates = self.extractCoordinates(node)
+
+        try:
+            successors = self.problem.getSuccessors(coordinates)
+        except TypeError:
+            # At least in some autograder cases a node was required instead of
+            # coordinates to get successors.
+            rawNode = self.getRawNode(coordinates)
+            successors = self.problem.getSuccessors(rawNode)
+
+        for s in successors:
+            if self.isAlreadyExpanded(s):
+                # No updates if already expanded.
+                continue
+            if self.isBreadthFirstSearch() and self.isAlreadyDiscovered(s):
+                continue
+            if self.isSearchWithUpdate() and self.isAlreadyDiscovered(s):
+                # It is possible for uniform search to find a lower cost route
+                # to a node.
+                self.updateUnvisitedNode(s, coordinates)
+                continue
+
+            # Add parent before adding unvisited nodes as route might need
+            # to be constructed. Route is needed at least for getting a cost
+            # for route leading to successor being added.
+            self.addNodeParent(s, coordinates)
+            self.addUnvisitedNode(s)
+
+    # Generate list of directions leading from starting position to passed
+    # coordinates.
+    def constructRoute(self, initialCoordinates):
         route = []
-        nextCoordinates = self.finalCoordinates
+        nextCoordinates = initialCoordinates
+
+        if self.DEBUG_PRINTS:
+            print "Constructing route starting from: " + str(initialCoordinates)
+
+        try:
+            nextParent = self.parents[nextCoordinates]
+        except KeyError:
+            # No parent for given initial coordinates. Expect these
+            # to be the coordinates of first node.
+            return route
 
         while True:
             nextParent = self.parents[nextCoordinates]
@@ -172,10 +241,14 @@ class Search:
         # Flip route as it is currently from finish to start
         route.reverse()
 
-        if self.DEBUG_PRINTS:
+        if self.DEBUG_ROUTE_PRINTS:
             self.routeDebugPrint(route)
 
         return route
+
+    # Generate list of directions from starting position to finish.
+    def constructFinalRoute(self):
+        return self.constructRoute(self.finalCoordinates)
 
     def isAlreadyExpanded(self, node):
         try:
@@ -191,6 +264,39 @@ class Search:
 
         return alreadyExpanded
 
+    def isAlreadyDiscovered(self, node):
+        alreadyDiscovered = None
+
+        try:
+            coordinates = self.extractCoordinates(node)
+            self.rawNodes[coordinates]
+            alreadyDiscovered = True
+        except KeyError:
+            if self.DEBUG_PRINTS:
+                print "Index " + str(coordinates) + " not found from rawNodes"
+            alreadyDiscovered = False
+
+        if None == alreadyDiscovered:
+            raise Exception("Failed to check if node is already discovered")
+
+        return alreadyDiscovered
+
+    def isNodeGoalState(self, node):
+        goalState = False
+        coordinates = self.extractCoordinates(node)
+
+        try:
+            goalState = self.problem.isGoalState(coordinates)
+        except AttributeError:
+            # At least in some autograder cases a node was required instead of
+            # coordinates to check for goal state.
+            rawNode = self.getRawNode(coordinates)
+            if self.DEBUG_PRINTS:
+                print "Querying goal state with raw node: " + str(rawNode)
+            goalState = self.problem.isGoalState(rawNode)
+
+        return goalState
+
     def markExpanded(self, node):
         if self.DEBUG_PRINTS:
             print "Consider following node as expanded: " + str(node)
@@ -198,20 +304,151 @@ class Search:
         coordinates = self.extractCoordinates(node)
         self.expandedCoordinates[coordinates] = True
 
+    # Test if route leading to passed node has lower cost if its parent had
+    # the passed coordinates. Update node position in coordinates waiting to
+    # be picked and node parent if cost is lower.
+    def updateUnvisitedNode(self, data, parentCoordinates):
+        if not (self.isUniformCostSearch() or self.isAstarSearch()):
+            raise Exception("Unexpected search updating visited node")
+
+        if self.DEBUG_PRINTS:
+            print "Updating unvisited node: " + str(data)
+
+        costs = []
+
+        successorCoordinates = self.extractCoordinates(data)
+        newDirection = self.extractDirection(data)
+        route = self.constructRoute(parentCoordinates)
+        route.append(newDirection)
+
+        if self.DEBUG_PRINTS:
+            print "Getting cost of actions for route: " + str(route)
+
+        if self.isUniformCostSearch():
+            costs.append(self.problem.getCostOfActions(route))
+        elif self.isAstarSearch():
+            costs = self.calculateAstarCost(successorCoordinates, data, route)
+
+        for cost in costs:
+            wasChanged = self.unvisitedCoordinates.update(successorCoordinates, cost)
+
+            if wasChanged:
+                self.addNodeParent(data, parentCoordinates)
+
     def addUnvisitedNode(self, data):
         if self.DEBUG_PRINTS:
             print "Adding unvisited coordinates from data: " + str(data)
 
         coordinates = self.extractCoordinates(data)
 
-        if self.DEBUG_PRINTS:
-            print "Pushing coordinates" + str(coordinates)
+        if self.isUniformCostSearch():
+            route = self.constructRoute(coordinates)
+            cost = self.problem.getCostOfActions(route)
 
-        self.unvisitedCoordinates.push(coordinates)
+            if self.DEBUG_PRINTS:
+                print "Pushing coordinates: " + str(coordinates) + " With cost: " + str(cost)
+
+            self.unvisitedCoordinates.push(coordinates, cost)
+        elif self.isAstarSearch():
+            costs = self.calculateAstarCost(coordinates, data)
+
+            if self.DEBUG_PRINTS:
+                print "Pushing coordinates: " + str(coordinates) + " With costs: " + str(costs)
+
+            for cost in costs:
+                self.unvisitedCoordinates.push(coordinates, cost)
+        else:
+            if self.DEBUG_PRINTS:
+                print "Pushing coordinates: " + str(coordinates)
+            self.unvisitedCoordinates.push(coordinates)
+
+        self.rawNodes[coordinates] = data
+
+    # Autograder had strings as goal states. For example Manhattan
+    # heuristic can't be used to calculate cost from strings.
+    # Nodes contain a value as a third item. Expect that this item
+    # is the number of hops needed to take to reach goal. In other
+    # words the values are interesting to greedy search part of A*.
+    def calculateAstarCost(self, coordinates, data, premadeRoute=None):
+        try:
+            costs = self.calculateAstarCostWithHeuristic(coordinates, premadeRoute)
+            if self.DEBUG_PRINTS:
+                print "Calculated A* costs: " + str(costs)
+            return costs
+        except TypeError:
+            costs = self.astarCostFromPredefinedGreedyCost(data, premadeRoute)
+            if self.DEBUG_PRINTS:
+                print "Calculated A* costs [predefined]: " + str(costs)
+            return costs
+
+        raise Exception("Could not calculate A* cost for" \
+                + " coordinates: " + str(coordinates) \
+                + " data:" + str(data) \
+                + " premadeRoute: " + str(premadeRoute))
+
+    def astarCostFromPredefinedGreedyCost(self, data, premadeRoute=None):
+        costs = []
+
+        coordinates = self.extractCoordinates(data)
+
+        if None != premadeRoute:
+            route = premadeRoute
+        else:
+            route = self.constructRoute(coordinates)
+
+        predefinedCost = self.extractCost(data)
+        uniformCost = self.problem.getCostOfActions(route)
+
+        if None == predefinedCost:
+            # Handle first node
+            predefinedCost = 0
+
+        costs.append(predefinedCost + uniformCost)
+
+        if self.DEBUG_PRINTS:
+            print "Got predefinedCost: " + str(predefinedCost) + " uniformCost: " + str(uniformCost)
+
+        self.astarCostSanityCheck(costs)
+
+        return costs
+
+    def calculateAstarCostWithHeuristic(self, coordinates, premadeRoute=None):
+        costs = []
+
+        if None != premadeRoute:
+            route = premadeRoute
+        else:
+            route = self.constructRoute(coordinates)
+
+        uniformCost = self.problem.getCostOfActions(route)
+        heuristicResult = self.heuristic(coordinates, self.problem)
+
+        if self.DEBUG_PRINTS:
+            print "HeuristicResult is: " + str(heuristicResult)
+
+        if self.problemHasMultipleGoals():
+            for greedyCost in heuristicResult:
+                costs.append(greedyCost + uniformCost)
+        else:
+            greedyCost = heuristicResult
+            costs.append(uniformCost + greedyCost)
+
+        if self.DEBUG_PRINTS:
+            print "Got greedyCost: " + str(greedyCost) + " uniformCost: " + str(uniformCost)
+
+        self.astarCostSanityCheck(costs)
+
+        return costs
+
+    def calculateAstarCostForMultipleGoals(self, coordinates):
+        goals = self.problem.goals
+
+        for goal in goals:
+            heuristicResult = self
 
     def pickNextCoordinates(self):
         if self.DEBUG_PRINTS:
-            print "Picking next coordinate from unvisitedCoordinates: " + str(self.unvisitedCoordinates)
+            print "<< Picking next coordinate from unvisitedCoordinates >>"
 
         if not self.unvisitedCoordinates.isEmpty():
             return self.unvisitedCoordinates.pop()
@@ -221,15 +458,18 @@ class Search:
     def addNodeParent(self, successor, parentCoordinates):
         successorCoordinates = self.extractCoordinates(successor)
         successorDirection = self.extractDirection(successor)
-        parent = (parentCoordinates, successorDirection)
+        parent = self.makeParent(parentCoordinates, successorDirection)
 
         self.parents[successorCoordinates] = parent
 
         if self.DEBUG_PRINTS:
-            print "Added parent: " + str(parent)
+            print "Added parent: " + str(parent) + " for: " + str(successorCoordinates)
 
     def makeNode(self, coordinates):
         return (coordinates, None, None)
+
+    def makeParent(self, parentCoordinates, successorDirection):
+        return (parentCoordinates, successorDirection)
 
     # Need to handle following different cases:
     # * getStartState() returns a tuple with coordinates.
@@ -241,7 +481,7 @@ class Search:
         if self.hasCoordinate(data) or self.hasAutograderCoordinate(data):
             return data[self.COORDINATES_POSITION]
 
-        if self.isBareCoordinate(data):
+        if self.isBareCoordinate(data) or self.isBareAutograderCoordinate(data):
             return data
 
         raise Exception("Failed to extract coordinates from data: " + str(data))
@@ -264,14 +504,27 @@ class Search:
 
         raise Exception("Failed to extract direction from data: " + str(data))
 
+    def extractCost(self, data):
+        if self.isBareAutograderCoordinate(data):
+            return None # First state does not contain cost
+
+        dataLen = len(data)
+        if self.dataHasAutograderCost(data, dataLen):
+            return data[self.COST_POSITION]
+
+        raise Exception("Failed to extract cost from data: " + str(data))
+
     def getFinalCoordinates(self):
         return self.finalCoordinates
+
+    def getRawNode(self, coordinates):
+        return self.rawNodes[coordinates]
 
     def isParentStartingPosition(self, parent):
         return None == self.extractDirection(parent)
 
     def hasAutograderCoordinate(self, data):
-        return str is type(data[self.COORDINATES_POSITION])
+        return tuple is type(data) and str is type(data[self.COORDINATES_POSITION])
 
     def hasCoordinate(self, data):
         return tuple is type(data[self.COORDINATES_POSITION])
@@ -288,6 +541,36 @@ class Search:
     def dataHasAutograderDirection(self, data, dataLen):
         return dataLen > 1 and self.hasAutograderCoordinate(data)
 
+    def dataHasAutograderCost(self, data, dataLen):
+        return dataLen > 2 and self.hasAutograderCoordinate(data)
+
+    def isDepthFirstSearch(self):
+        return self.DFS_TYPE == self.searchType
+
+    def isBreadthFirstSearch(self):
+        return self.BFS_TYPE == self.searchType
+
+    def isUniformCostSearch(self):
+        return self.UCS_TYPE == self.searchType
+
+    def isAstarSearch(self):
+        return self.ASTAR_TYPE == self.searchType
+
+    def isSearchWithUpdate(self):
+        return self.isUniformCostSearch() or self.isAstarSearch()
+
+    def problemHasMultipleGoals(self):
+        return self.getOptionValue(OPT_KEY_MULTIPLE_GOALS)
+
+    def problemHasStrGoal(self):
+        return self.getOptionValue(OPT_KEY_STR_GOAL)
+
+    def getOptionValue(self, key):
+        try:
+            return self.options[key]
+        except KeyError:
+            return False
+
     def parentSanityCheck(self, parent, direction, coordinates):
         if None == direction:
             raise Exception("Could not extract direction from parent: " + str(parent))
@@ -295,11 +578,40 @@ class Search:
         if None == coordinates:
             raise Exception("Could not extract coordinates from parent: " + str(parent))
 
+    def astarCostSanityCheck(self, costs):
+        if [] == costs:
+            raise Exception("Failed to calculate A* cost from coordinates: " \
+                    + str(coordinates) + " and premadeRoute: " \
+                    + str(premadeRoute))
+
+        if not isinstance(costs, list):
+            raise Exception("Ended up with non-list costs: " + str(costs))
+
     def routeDebugPrint(self, route):
         print "---== Printing route ==---"
-        for d in route:
-            print str(d)
+        print str(route)
         print "---== Done printing route ==---"
+
+def getSearchFinishBanner(route, finalCoordinates, problem, searchTime):
+    bannerDisabled = True
+    isGoalState = None
+
+    if bannerDisabled:
+        return ""
+
+    try:
+        isGoalState = problem.isGoalState(finalCoordinates)
+    except AttributeError:
+        isGoalState = problem.isGoalState(search.getRawNode(finalCoordinates))
+
+    searchFinishBanner = "\n"
+    searchFinishBanner += "==================== Search Done ====================" + "\n"
+    searchFinishBanner += "Got route: " + str(route) + "\n"
+    searchFinishBanner += "Result is goal state? -> " + str(isGoalState) + "\n"
+    searchFinishBanner += "Search took %s seconds" % (searchTime) + "\n"
+    searchFinishBanner += "==================== Search Done ====================" + "\n"
+
+    return searchFinishBanner
 
 def depthFirstSearch(problem):
     """
@@ -319,22 +631,15 @@ def depthFirstSearch(problem):
 
     import time
 
-    search = Search(problem)
+    search = Search(problem, "dfs")
     startTime = time.time()
     route = search.run()
     stopTime = time.time()
 
     finalCoordinates = search.getFinalCoordinates()
-
-    searchFinishBanner = "\n"
-    searchFinishBanner += "==================== Search Done ====================" + "\n"
-    searchFinishBanner += "Got route: " + str(route) + "\n"
-    searchFinishBanner += "Result is goal state? -> " + str(problem.isGoalState(finalCoordinates)) + "\n"
-    searchFinishBanner += "Search took %s seconds" % (stopTime - startTime) + "\n"
-    searchFinishBanner += "==================== Search Done ====================" + "\n"
+    searchFinishBanner = getSearchFinishBanner(route, finalCoordinates, problem, stopTime - startTime)
 
     print searchFinishBanner
-
     latestRunFile = open('latest_run.txt', 'w')
     latestRunFile.write(searchFinishBanner)
 
@@ -343,12 +648,42 @@ def depthFirstSearch(problem):
 def breadthFirstSearch(problem):
     """Search the shallowest nodes in the search tree first."""
     "*** YOUR CODE HERE ***"
-    util.raiseNotDefined()
+
+    import time
+
+    search = Search(problem, "bfs")
+    startTime = time.time()
+    route = search.run()
+    stopTime = time.time()
+
+    finalCoordinates = search.getFinalCoordinates()
+    searchFinishBanner = getSearchFinishBanner(route, finalCoordinates, problem, stopTime - startTime)
+
+    print searchFinishBanner
+    latestRunFile = open('latest_run.txt', 'w')
+    latestRunFile.write(searchFinishBanner)
+
+    return route
 
 def uniformCostSearch(problem):
     """Search the node of least total cost first."""
     "*** YOUR CODE HERE ***"
-    util.raiseNotDefined()
+
+    import time
+
+    search = Search(problem, "ucs")
+    startTime = time.time()
+    route = search.run()
+    stopTime = time.time()
+
+    finalCoordinates = search.getFinalCoordinates()
+    searchFinishBanner = getSearchFinishBanner(route, finalCoordinates, problem, stopTime - startTime)
+
+    print searchFinishBanner
+    latestRunFile = open('latest_run.txt', 'w')
+    latestRunFile.write(searchFinishBanner)
+
+    return route
 
 def nullHeuristic(state, problem=None):
     """
@@ -357,10 +692,58 @@ def nullHeuristic(state, problem=None):
     """
     return 0
 
-def aStarSearch(problem, heuristic=nullHeuristic):
+def isMultiGoalProblem(problem):
+    try:
+        goal = problem.goal
+        return False
+    except AttributeError:
+        pass
+
+    goals = problem.goals
+
+    return True
+
+def isStrGoalProblem(problem):
+    if isMultiGoalProblem(problem):
+        goal = problem.goals[0]
+    else:
+        goal = problem.goal
+
+    return str is type(goal)
+
+def aStarSearch(problem, heuristic=None):
     """Search the node that has the lowest combined cost and heuristic first."""
     "*** YOUR CODE HERE ***"
-    util.raiseNotDefined()
+
+    import time
+    from searchAgents import manhattanHeuristic
+    from searchAgents import manhattanHeuristicMultiGoal
+
+    options = {}
+
+    if None == heuristic and isMultiGoalProblem(problem):
+        heuristic = manhattanHeuristicMultiGoal
+        options[OPT_KEY_MULTIPLE_GOALS] = True
+    elif None == heuristic:
+        heuristic = manhattanHeuristic
+
+    if isStrGoalProblem(problem):
+        options[OPT_KEY_STR_GOAL] = True
+
+    search = Search(problem, "astar", heuristic, options)
+
+    startTime = time.time()
+    route = search.run()
+    stopTime = time.time()
+
+    finalCoordinates = search.getFinalCoordinates()
+    searchFinishBanner = getSearchFinishBanner(route, finalCoordinates, problem, stopTime - startTime)
+
+    print searchFinishBanner
+    latestRunFile = open('latest_run.txt', 'w')
+    latestRunFile.write(searchFinishBanner)
+
+    return route
 
 
 # Abbreviations
@@ -368,3 +751,6 @@ bfs = breadthFirstSearch
 dfs = depthFirstSearch
 astar = aStarSearch
 ucs = uniformCostSearch
+
+OPT_KEY_MULTIPLE_GOALS = "multiple_goals"
+OPT_KEY_STR_GOAL = "str_goal"
